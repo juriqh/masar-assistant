@@ -1,5 +1,14 @@
-# tasks/pre_class.py
-from app.orchestrator import pre_class
+# tasks/pre_class_reminder.py
+import argparse
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from app import orchestrator
 
 if __name__ == "__main__":
-    pre_class()
+    p = argparse.ArgumentParser()
+    p.add_argument("--asof", type=str, help="YYYY-MM-DD HH:MM (Asia/Riyadh)")
+    args = p.parse_args()
+    asof_dt = None
+    if args.asof:
+        asof_dt = datetime.strptime(args.asof, "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo("Asia/Riyadh"))
+    orchestrator.pre_class_reminder(asof=asof_dt)
