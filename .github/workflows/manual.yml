@@ -1,1 +1,67 @@
+name: manual-run
 
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Which task to run"
+        required: true
+        type: choice
+        options:
+          - morning
+          - pre
+          - post
+          - end_of_day
+          - tick
+          - heartbeat
+      dry_run:
+        description: "Override DRY_RUN (true/false) — optional"
+        required: false
+        default: ""
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: masar-manual
+      cancel-in-progress: false
+    env:
+      PYTHONUNBUFFERED: "1"
+      # Secrets
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      DISCORD_WEBHOOK_LOG_URL: ${{ secrets.DISCORD_WEBHOOK_LOG_URL }}
+      # Vars with optional override
+      TZ_USER: ${{ vars.TZ_USER }}
+      DRY_RUN: ${{ inputs.dry_run || vars.DRY_RUN || 'true' }}
+      MORNING_DIGEST_TIME: ${{ vars.MORNING_DIGEST_TIME }}
+      END_OF_DAY_TIME: ${{ vars.END_OF_DAY_TIME }}
+      PRE_CLASS_OFFSET: ${{ vars.PRE_CLASS_OFFSET }}
+      POST_CLASS_GRACE: ${{ vars.POST_CLASS_GRACE }}
+      ACTIVE_USER: ${{ vars.ACTIVE_USER }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install supabase requests google-genai; fi
+      - name: Run selected task
+        shell: bash
+        run: |
+          case "${{ inputs.task }}" in
+            morning)    python tasks/morning_digest.py ;;
+            pre)        python tasks/pre_class.py ;;
+            post)       python tasks/post_class.py ;;
+            end_of_day) python tasks/end_of_day.py ;;
+            tick)       python tasks/tick.py ;;
+            heartbeat)  python tasks/heartbeat.py ;;
+            *) echo "Unknown task"; exit 1 ;;
+          esac
