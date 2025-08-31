@@ -2,7 +2,7 @@ name: morning-digest
 
 on:
   schedule:
-    # 04:00 UTC ≈ 07:00 Asia/Riyadh (no DST)
+    # 04:00 UTC ≈ 07:00 Asia/Riyadh
     - cron: "0 4 * * *"
   workflow_dispatch: {}
 
@@ -15,6 +15,7 @@ jobs:
       cancel-in-progress: true
     env:
       PYTHONUNBUFFERED: "1"
+      PYTHONPATH: .
       # Secrets
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
@@ -39,6 +40,10 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install supabase requests google-genai; fi
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install supabase requests google-genai
+          fi
       - name: Morning digest
-        run: python tasks/morning_digest.py
+        run: python -m tasks.morning_digest
