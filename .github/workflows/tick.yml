@@ -14,6 +14,7 @@ jobs:
       cancel-in-progress: true
     env:
       PYTHONUNBUFFERED: "1"
+      PYTHONPATH: .
       # Secrets
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
@@ -38,6 +39,10 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install supabase requests google-genai; fi
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install supabase requests google-genai
+          fi
       - name: Tick (pre/post/end-of-day logic)
-        run: python tasks/tick.py
+        run: python -m tasks.tick
