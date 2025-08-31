@@ -1,3 +1,4 @@
+import os
 # app/orchestrator.py (top env section)
 ACTIVE_USER = (os.getenv("ACTIVE_USER", "fatoom") or "fatoom").strip()
 # ... keep the rest
