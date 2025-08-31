@@ -58,10 +58,11 @@ jobs:
           echo "Run case \"$CASE\" in"
           if [ "$CASE" = "preclass" ]; then
             if [ -n "$ASOF" ]; then
-              python -m tasks.pre_class_reminder --asof "$ASOF"
+              python -m tasks.pre_class --asof "$ASOF"
             else
-              python -m tasks.pre_class_reminder
+              python -m tasks.pre_class
             fi
           else
             python -m tasks.morning_digest
           fi
+
