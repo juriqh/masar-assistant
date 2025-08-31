@@ -61,7 +61,7 @@ def _active_user(ctx: Client) -> UserCtx:
 def _fetch_user_classes(ctx: Client, user_id: str) -> List[Dict[str, Any]]:
     res = (
         ctx.table("classes")
-        .select("id, class_code, class_name, location, days_of_week, start_time, end_time, active")
+        .select("id, class_code, class_name, location, days_of_week, start_time, end_time, remind_before_minutes, active")
         .eq("user_id", user_id)
         .eq("active", True)
         .order("start_time")
@@ -124,11 +124,9 @@ def _log_event(ctx: Client, task: str, status: str, message: str) -> None:
 def morning_digest() -> None:
     ctx = supa()
     now_ry = datetime.now(RY)
-
-    # user
     user = _active_user(ctx)
 
-    # dedupe
+    # per-day dedupe
     if os.getenv("DRY_RUN","false").lower() != "true" and _already_sent_today(ctx, "morning_digest", now_ry):
         msg = f"MorningDigest skipped (already sent for {now_ry.date()}) — user={user.handle}"
         _log_event(ctx, "morning_digest", "skipped", msg)
@@ -139,7 +137,7 @@ def morning_digest() -> None:
     rows = _fetch_user_classes(ctx, user.id)
     todays = [r for r in rows if _matches_today(r.get("days_of_week"), tokens)]
 
-    # ---- dedupe by (title, start, end)
+    # dedupe by (title, start, end)
     seen = set()
     unique: List[Dict[str,Any]] = []
     for r in todays:
@@ -168,3 +166,69 @@ def morning_digest() -> None:
     discord_post(msg)
     _log_event(ctx, "morning_digest", "sent", f"{len(todays)} classes | user={user.handle}")
     discord_post(f"✅ MorningDigest {now_ry:%Y-%m-%d} — {len(todays)} classes (user={user.handle})", is_log=True)
+
+# ---------- PRE-CLASS REMINDER (T-X) ----------
+def _preclass_key(class_id: int, start_dt_ry: datetime) -> str:
+    return f"cid={class_id}|start={start_dt_ry:%Y-%m-%d %H:%M}"
+
+def _preclass_already_sent(ctx: Client, key: str) -> bool:
+    res = (
+        ctx.table("events_log")
+        .select("id")
+        .eq("task", "preclass")
+        .eq("status", "sent")
+        .eq("message", key)
+        .limit(1)
+        .execute()
+    )
+    return bool(res.data)
+
+def _mark_preclass_sent(ctx: Client, key: str) -> None:
+    _log_event(ctx, "preclass", "sent", key)
+
+def pre_class_reminder(asof: Optional[datetime] = None) -> None:
+    """
+    Sends ONE reminder for the nearest class whose start time is within its
+    remind window (0..remind_before_minutes) from now/asof (Riyadh).
+    Dedupe key: cid + start datetime (per day, per class).
+    """
+    ctx = supa()
+    now_ry = (asof or datetime.now(RY)).astimezone(RY)
+    user = _active_user(ctx)
+    tokens = _day_tokens(now_ry)
+
+    rows = _fetch_user_classes(ctx, user.id)
+    todays = [r for r in rows if _matches_today(r.get("days_of_week"), tokens)]
+
+    candidates: List[Dict[str, Any]] = []
+    for r in todays:
+        start_s = r.get("start_time")
+        if not start_s:
+            continue
+        hh, mm = int(start_s[:2]), int(start_s[3:5])
+        start_dt = now_ry.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        delta_min = int((start_dt - now_ry).total_seconds() // 60)
+        remind_min = int(r.get("remind_before_minutes") or 30)
+        if 0 <= delta_min <= remind_min:
+            r["_start_dt"] = start_dt
+            r["_delta_min"] = delta_min
+            candidates.append(r)
+
+    if not candidates:
+        discord_post(f"ℹ️ No class inside reminder window @ {now_ry:%Y-%m-%d %H:%M} (Asia/Riyadh).", is_log=True)
+        return
+
+    # Pick the closest one
+    cand = sorted(candidates, key=lambda r: (r["_delta_min"], r.get("start_time")))[0]
+    start_dt = cand["_start_dt"]
+    key = _preclass_key(int(cand["id"]), start_dt)
+    if _preclass_already_sent(ctx, key):
+        discord_post(f"🟨 Preclass already sent for {key}", is_log=True)
+        return
+
+    name = _title(cand)
+    when = _fmt_hhmm(cand.get("start_time"))
+    note = f"تذكير ⏰\n{ name } بعد {cand['_delta_min']} دقيقة ({when})"
+    discord_post(note)
+    _mark_preclass_sent(ctx, key)
+    discord_post(f"✅ Preclass sent | {key}", is_log=True)
