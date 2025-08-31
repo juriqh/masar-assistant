@@ -1,26 +1,80 @@
-# .github/workflows/manual-run.yml  (example)
+name: Manual Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      case:
+        description: Which task to run?
+        type: choice
+        options: [morning]
+        default: morning
+      dry_run:
+        description: DRY_RUN mode (true prints/logs only)
+        type: boolean
+        default: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-      DISCORD_WEBHOOK_LOG_URL: ${{ secrets.DISCORD_WEBHOOK_LOG_URL }}
-      ACTIVE_USER: magical_pomelo_39468
-      TZ_USER: Asia/Riyadh
-      DRY_RUN: "false"
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.12' }
-      - run: pip install -U supabase google-genai requests
-      - name: Verify env presence (masked)
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ---- Map secrets into env (supports either SUPABASE_KEY or SUPABASE_ANON_KEY) ----
+      - name: Export runtime env
+        shell: bash
+        run: |
+          # Required
+          echo "ACTIVE_USER=magical_pomelo_39468" >> $GITHUB_ENV
+          echo "TZ_USER=Asia/Riyadh" >> $GITHUB_ENV
+          echo "DRY_RUN=${{ inputs.dry_run }}" >> $GITHUB_ENV
+
+          # Supabase URL
+          if [ -n "${{ secrets.SUPABASE_URL }}" ]; then
+            echo "SUPABASE_URL=${{ secrets.SUPABASE_URL }}" >> $GITHUB_ENV
+          else
+            echo "Supabase URL secret not set (SUPABASE_URL)"; exit 1
+          fi
+
+          # Supabase anon key (accept either name)
+          if [ -n "${{ secrets.SUPABASE_KEY }}" ]; then
+            echo "SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}" >> $GITHUB_ENV
+          elif [ -n "${{ secrets.SUPABASE_ANON_KEY }}" ]; then
+            echo "SUPABASE_KEY=${{ secrets.SUPABASE_ANON_KEY }}" >> $GITHUB_ENV
+          else
+            echo "Supabase key secret not set (SUPABASE_KEY or SUPABASE_ANON_KEY)"; exit 1
+          fi
+
+          # Discord (optional but recommended)
+          if [ -n "${{ secrets.DISCORD_WEBHOOK_URL }}" ]; then
+            echo "DISCORD_WEBHOOK_URL=${{ secrets.DISCORD_WEBHOOK_URL }}" >> $GITHUB_ENV
+          fi
+          if [ -n "${{ secrets.DISCORD_WEBHOOK_LOG_URL }}" ]; then
+            echo "DISCORD_WEBHOOK_LOG_URL=${{ secrets.DISCORD_WEBHOOK_LOG_URL }}" >> $GITHUB_ENV
+          fi
+
+      - name: Verify env presence (temporary)
         run: |
           python - << 'PY'
           import os
-          for k in ['SUPABASE_URL','SUPABASE_KEY','DISCORD_WEBHOOK_URL','ACTIVE_USER','TZ_USER','DRY_RUN']:
-              print(f"{k}: {'set' if os.getenv(k) else 'MISSING'}")
+          for k in ["SUPABASE_URL","SUPABASE_KEY","ACTIVE_USER","TZ_USER","DRY_RUN","DISCORD_WEBHOOK_URL","DISCORD_WEBHOOK_LOG_URL"]:
+              print(f"{k} => {'SET' if os.getenv(k) else 'MISSING'}")
           PY
-      - name: Run morning
-        run: python -m tasks.morning_digest
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -U supabase requests google-genai
+
+      - name: Run case
+        env:
+          CASE: ${{ inputs.case }}
+        run: |
+          echo "Run case \"$CASE\" in"
+          python -m tasks.morning_digest
