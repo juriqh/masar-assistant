@@ -28,6 +28,7 @@ jobs:
       cancel-in-progress: false
     env:
       PYTHONUNBUFFERED: "1"
+      PYTHONPATH: .
       # Secrets
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
@@ -57,11 +58,11 @@ jobs:
         shell: bash
         run: |
           case "${{ inputs.task }}" in
-            morning)    python tasks/morning_digest.py ;;
-            pre)        python tasks/pre_class.py ;;
-            post)       python tasks/post_class.py ;;
-            end_of_day) python tasks/end_of_day.py ;;
-            tick)       python tasks/tick.py ;;
-            heartbeat)  python tasks/heartbeat.py ;;
+            morning)    python -m tasks.morning_digest ;;
+            pre)        python -m tasks.pre_class ;;
+            post)       python -m tasks.post_class ;;
+            end_of_day) python -m tasks.end_of_day ;;
+            tick)       python -m tasks.tick ;;
+            heartbeat)  python -m tasks.heartbeat ;;
             *) echo "Unknown task"; exit 1 ;;
           esac
