@@ -1,0 +1,10 @@
+name: morning-old-disabled
+on:
+  schedule: []         # disable any cron
+  workflow_dispatch: {}  # can still run manually if you want
+jobs:
+  disabled:
+    if: ${{ false }}   # never runs
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo disabled
