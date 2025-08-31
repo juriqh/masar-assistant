@@ -1,146 +1,211 @@
 # app/orchestrator.py
 from __future__ import annotations
+
 import os
-from typing import Optional, Dict, Any, List
-from . import db
-from . import notifier as nt
-from .time_utils import (
-    now_local, today_local, tomorrow_local, day_token,
-    combine_date_time, within_minutes, ended_within_minutes, fmt_hhmm
-)
-from .schedule_parser import build_sessions_for_date
-from .embeddings_rag import search_recent_notes
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from typing import Any, Dict, List, Optional
 
-# ----- Config from env (with safe defaults) -----
-ACTIVE_USER = (os.getenv("ACTIVE_USER", "fatoom") or "fatoom").strip()
-PRE_CLASS_OFFSET = int((os.getenv("PRE_CLASS_OFFSET", "30") or "30"))
-POST_CLASS_GRACE = int((os.getenv("POST_CLASS_GRACE", "5") or "5"))
-MORNING_TIME = (os.getenv("MORNING_DIGEST_TIME", "07:00") or "07:00")
-END_DAY_TIME = (os.getenv("END_OF_DAY_TIME", "20:00") or "20:00")
+import requests
+from supabase import create_client, Client
 
-def _get_user() -> Optional[Dict[str, Any]]:
-    u = db.get_user_by_handle(ACTIVE_USER)
-    if not u:
-        try:
-            handles = db.debug_user_handles()
-        except Exception:
-            handles = []
-        nt.log(f"lookup failed: handle='{ACTIVE_USER}'. Known handles: {handles}")
-    return u
+RY = ZoneInfo("Asia/Riyadh")
 
-def morning_digest() -> None:
-    user = _get_user()
-    if not user:
-        nt.log("morning_digest: no user")
+# ------------------------ Utilities & Clients ------------------------
+
+def _env_get(name: str, default: Optional[str] = None) -> str:
+    v = os.getenv(name, default)
+    if v is None or v == "":
+        raise RuntimeError(f"Missing required env var: {name}")
+    return v
+
+def supa() -> Client:
+    url = _env_get("SUPABASE_URL")
+    key = _env_get("SUPABASE_KEY")
+    return create_client(url, key)
+
+def discord_post(content: str, is_log: bool = False) -> None:
+    url = os.getenv("DISCORD_WEBHOOK_LOG_URL") if is_log else os.getenv("DISCORD_WEBHOOK_URL")
+    if not url:
+        # Silently no-op if webhook missing (useful during DRY runs)
         return
-    today = today_local()
-    if db.already_sent("morning_digest", today):
+    try:
+        requests.post(url, json={"content": content}, timeout=10)
+    except Exception as e:
+        # Last-ditch: don’t crash the job because of Discord
+        print(f"[orchestrator] Discord post failed: {e}")
+
+def _fmt_hhmm(t: str | None) -> str:
+    # Supabase returns '08:00:00' strings for time columns
+    if not t:
+        return "--:--"
+    return t[:5]
+
+def _day_tokens(dt: datetime) -> List[str]:
+    short = dt.strftime("%a")      # 'Mon'
+    full  = dt.strftime("%A")      # 'Monday'
+    # Arabic variants commonly seen
+    ar = {
+        "Sun": ["الأحد", "الاحد", "أحد"],
+        "Mon": ["الإثنين", "الاثنين", "اثنين"],
+        "Tue": ["الثلاثاء"],
+        "Wed": ["الأربعاء", "الاربعاء"],
+        "Thu": ["الخميس"],
+        "Fri": ["الجمعة"],
+        "Sat": ["السبت"],
+    }
+    toks = [short, full]
+    toks.extend(ar.get(short, []))
+    # Lowercase everything for matching
+    return [t.lower() for t in toks]
+
+@dataclass
+class UserCtx:
+    id: str
+    handle: str
+
+def _active_user(ctx: Client) -> UserCtx:
+    handle = os.getenv("ACTIVE_USER", "").strip()
+    if handle:
+        res = ctx.table("users").select("id, handle").eq("handle", handle).limit(1).execute()
+        rows = res.data or []
+        if rows:
+            return UserCtx(id=rows[0]["id"], handle=rows[0]["handle"])
+        raise RuntimeError(f"ACTIVE_USER '{handle}' not found in users table.")
+    # Fallback: first active user
+    res = ctx.table("users").select("id, handle").eq("active", True).limit(1).execute()
+    rows = res.data or []
+    if not rows:
+        raise RuntimeError("No active user found and ACTIVE_USER not set.")
+    return UserCtx(id=rows[0]["id"], handle=rows[0]["handle"])
+
+def _fetch_user_classes(ctx: Client, user_id: str) -> List[Dict[str, Any]]:
+    res = (
+        ctx.table("classes")
+        .select("id, class_code, class_name, location, days_of_week, start_time, end_time, active")
+        .eq("user_id", user_id)
+        .eq("active", True)
+        .order("start_time")  # server-side sort
+        .execute()
+    )
+    return res.data or []
+
+def _matches_today(days_text: Optional[str], today_tokens_lower: List[str]) -> bool:
+    if not days_text:
+        return False
+    txt = str(days_text).lower()
+    # Accept any token present, tolerate separators (commas, slashes, spaces)
+    return any(tok in txt for tok in today_tokens_lower)
+
+# ------------------------ Dedupe (per-day) ------------------------
+
+def _day_bounds_utc(target_ry: datetime) -> tuple[datetime, datetime]:
+    # Day in Riyadh → map to UTC bounds for created_at filtering
+    start_ry = target_ry.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_ry = start_ry + timedelta(days=1)
+    return start_ry.astimezone(timezone.utc), end_ry.astimezone(timezone.utc)
+
+def _already_sent_today(ctx: Client, task: str, target_ry: datetime) -> bool:
+    start_utc, end_utc = _day_bounds_utc(target_ry)
+    res = (
+        ctx.table("events_log")
+        .select("id")
+        .eq("task", task)
+        .gte("created_at", start_utc.isoformat())
+        .lt("created_at", end_utc.isoformat())
+        .limit(1)
+        .execute()
+    )
+    return bool(res.data)
+
+def _log_event(ctx: Client, task: str, status: str, message: str) -> None:
+    try:
+        ctx.table("events_log").insert({"task": task, "status": status, "message": message}).execute()
+    except Exception as e:
+        print(f"[orchestrator] events_log insert failed: {e}")
+
+# ------------------------ Morning Digest ------------------------
+
+def morning_digest(force: bool = False, asof: Optional[datetime] = None) -> None:
+    """
+    Send a morning schedule message for the *whole day* (no upcoming filter).
+    - force: bypass per-day dedupe
+    - asof: test a specific Riyadh datetime (timezone-aware or naive local string you pass in)
+    """
+    ctx = supa()
+    now_ry = (asof or datetime.now(RY)).astimezone(RY)
+
+    try:
+        user = _active_user(ctx)
+    except Exception as e:
+        discord_post(f"⚠️ MorningDigest: user lookup failed — {e}", is_log=True)
+        raise
+
+    if not force and _already_sent_today(ctx, "morning_digest", now_ry):
+        msg = f"MorningDigest skipped (already sent for {now_ry.date()}) — user={user.handle}"
+        _log_event(ctx, "morning_digest", "skipped", msg)
+        discord_post(f"🟨 {msg}", is_log=True)
         return
-    classes = db.get_classes_for_day(user["id"], day_token(today))
-    reminders = db.get_reminders_for_date(user["id"], today, None)
 
-    lines: List[str] = []
-    if classes:
-        lines.append("**Today's classes:**")
-        for c in classes:
-            st = fmt_hhmm(str(c["start_time"]))
-            en = fmt_hhmm(str(c["end_time"]))
-            loc = c.get("location") or ""
-            lines.append(f"- {c['class_code']} · {c['class_name']} · {st}–{en} @ {loc}")
-    else:
-        lines.append("No classes today 🎉")
+    tokens = _day_tokens(now_ry)  # e.g., ['mon','monday','الإثنين','الاثنين','اثنين']
+    rows = _fetch_user_classes(ctx, user.id)
+    todays = [r for r in rows if _matches_today(r.get("days_of_week"), tokens)]
 
-    if reminders:
-        lines += ["", "**Reminders:**"]
-        for r in reminders:
-            lines.append(f"• {r['message']}")
-
-    msg = "صباح الخير ☀️\n" + "\n".join(lines)
-    ok = nt.send(msg)
-    db.log_event("morning_digest", "success" if ok else "fail", message="sent", user_id=user["id"])
-
-def pre_class() -> None:
-    user = _get_user()
-    if not user:
-        nt.log("pre_class: no user")
+    if not todays:
+        text = "صباح الخير ☀️\nNo classes today 🎉"
+        discord_post(text)
+        _log_event(ctx, "morning_digest", "sent", f"no-classes | user={user.handle}")
         return
-    now = now_local()
-    classes = db.get_classes_for_day(user["id"], day_token(now.date()))
-    sessions = build_sessions_for_date(classes, now.date())
 
-    for s in sessions:
-        if within_minutes(s["start_dt"], PRE_CLASS_OFFSET, now):
-            c = s["class"]
-            last_notes = search_recent_notes(user["id"], c["id"], limit=1)
-            snippet = ""
-            if last_notes:
-                n = last_notes[0]
-                title = n.get("title") or "previous notes"
-                snippet = f"\n**Review:** {title}"
-            rems = db.get_reminders_for_date(user["id"], now.date(), c["id"])
-            rem_txt = ""
-            if rems:
-                rem_txt = "\n**Don't forget:** " + "; ".join([r["message"] for r in rems])
+    # Format lines
+    lines = []
+    for r in todays:
+        start = _fmt_hhmm(r.get("start_time"))
+        end = _fmt_hhmm(r.get("end_time"))
+        name = (r.get("class_name") or "").strip()
+        code = (r.get("class_code") or "").strip()
+        title = name if name else code if code else "Class"
+        loc = (r.get("location") or "").strip()
+        if loc:
+            lines.append(f"{start}–{end} — {title} · {loc}")
+        else:
+            lines.append(f"{start}–{end} — {title}")
 
-            st = fmt_hhmm(str(c["start_time"]))
-            msg = f"🔔 {c['class_code']} starts in ≤{PRE_CLASS_OFFSET} min ({st}).{snippet}{rem_txt}"
-            ok = nt.send(msg)
-            db.log_event("pre_class", "success" if ok else "fail", message=f"{c['class_code']}", user_id=user["id"], class_id=c["id"])
+    header = "صباح الخير ☀️\n"
+    body = "\n".join(lines)
+    discord_post(header + body)
+    _log_event(ctx, "morning_digest", "sent", f"{len(todays)} classes | user={user.handle}")
+    discord_post(f"✅ MorningDigest sent for {now_ry.strftime('%Y-%m-%d')} — {len(todays)} classes (user={user.handle})", is_log=True)
 
-def post_class() -> None:
-    user = _get_user()
-    if not user:
-        nt.log("post_class: no user")
-        return
-    now = now_local()
-    classes = db.get_classes_for_day(user["id"], day_token(now.date()))
-    sessions = build_sessions_for_date(classes, now.date())
-    for s in sessions:
-        if ended_within_minutes(s["end_dt"], POST_CLASS_GRACE, now):
-            c = s["class"]
-            msg = (
-                f"✅ {c['class_code']} finished.\n"
-                "Do you want to upload notes/files now? I’ll file them under today’s date."
-            )
-            ok = nt.send(msg)
-            db.log_event("post_class", "success" if ok else "fail", message=f"{c['class_code']}", user_id=user["id"], class_id=c["id"])
+# ------------------------ (Optional) Other hooks you might call later ------------------------
 
-            after = [x for x in sessions if x["start_dt"] > s["start_dt"]]
-            if after:
-                nxt = after[0]["class"]
-                rems = db.get_reminders_for_date(user["id"], now.date(), nxt["id"])
-                if rems:
-                    msg2 = f"🎒 Next: {nxt['class_code']} — bring: " + ", ".join([r["message"] for r in rems])
-                    nt.send(msg2)
+def pre_class_reminder(asof: Optional[datetime] = None) -> None:
+    """Example: send a T-minus reminder based on `remind_before_minutes` (kept minimal)."""
+    ctx = supa()
+    now_ry = (asof or datetime.now(RY)).astimezone(RY)
+    user = _active_user(ctx)
+    tokens = _day_tokens(now_ry)
+    rows = _fetch_user_classes(ctx, user.id)
+    todays = [r for r in rows if _matches_today(r.get("days_of_week"), tokens)]
 
-def end_of_day() -> None:
-    user = _get_user()
-    if not user:
-        nt.log("end_of_day: no user")
-        return
-    today = today_local()
-    classes = db.get_classes_for_day(user["id"], day_token(today))
-    notes = db.get_notes_for_day(user["id"], today)
+    # Find next class that hasn't started yet and is within its reminder window
+    for r in todays:
+        start_s = r.get("start_time")
+        if not start_s:
+            continue
+        # Build today's datetime for that start time in Riyadh
+        hh, mm = int(start_s[:2]), int(start_s[3:5])
+        start_dt = now_ry.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        delta_min = int((start_dt - now_ry).total_seconds() // 60)
+        remind_min = int(r.get("remind_before_minutes") or 0)
+        if 0 <= delta_min <= max(remind_min, 30):  # default 30 if not set
+            name = (r.get("class_name") or r.get("class_code") or "Class").strip() or "Class"
+            text = f"تذكير ⏰\n{delta_min} دقيقة وتبدأ {name} ({_fmt_hhmm(start_s)})"
+            discord_post(text)
+            return
 
-    lines: List[str] = ["**Today summary:**"]
-    if classes:
-        lines.append("• Classes completed: " + ", ".join([c["class_code"] for c in classes]))
-    else:
-        lines.append("• No classes today.")
-
-    if notes:
-        lines.append("• Notes uploaded: " + ", ".join([n.get("title") or "untitled" for n in notes]))
-    else:
-        lines.append("• No notes uploaded today.")
-
-    tomorrow = tomorrow_local()
-    tmr = db.get_classes_for_day(user["id"], day_token(tomorrow))
-    if tmr:
-        lines += ["", "**Tomorrow:**"]
-        for c in tmr:
-            st = fmt_hhmm(str(c["start_time"]))
-            lines.append(f"- {c['class_code']} {st}")
-        lines.append("\nWant me to remind you to bring anything for a class tomorrow?")
-
-    ok = nt.send("\n".join(lines))
-    db.log_event("end_of_day", "success" if ok else "fail", message="sent", user_id=user["id"])
+def end_of_day_summary(asof: Optional[datetime] = None) -> None:
+    """Stub: summarize attended/uploaded notes, and preview tomorrow (fill when your DB is ready)."""
+    now_ry = (asof or datetime.now(RY)).astimezone(RY)
+    discord_post(f"ملخص اليوم 📘 ({now_ry.strftime('%Y-%m-%d')}) — coming soon.")
