@@ -6,12 +6,16 @@ on:
       case:
         description: Which task to run?
         type: choice
-        options: [morning]
+        options: [morning, preclass]
         default: morning
       dry_run:
         description: DRY_RUN mode (true prints/logs only)
         type: boolean
         default: false
+      asof:
+        description: Optional "YYYY-MM-DD HH:MM" (Asia/Riyadh) for testing preclass
+        type: string
+        default: ""
 
 jobs:
   run:
@@ -26,46 +30,20 @@ jobs:
         with:
           python-version: "3.12"
 
-      # ---- Map secrets into env (supports either SUPABASE_KEY or SUPABASE_ANON_KEY) ----
       - name: Export runtime env
         shell: bash
         run: |
-          # Required
           echo "ACTIVE_USER=magical_pomelo_39468" >> $GITHUB_ENV
           echo "TZ_USER=Asia/Riyadh" >> $GITHUB_ENV
           echo "DRY_RUN=${{ inputs.dry_run }}" >> $GITHUB_ENV
-
-          # Supabase URL
-          if [ -n "${{ secrets.SUPABASE_URL }}" ]; then
-            echo "SUPABASE_URL=${{ secrets.SUPABASE_URL }}" >> $GITHUB_ENV
-          else
-            echo "Supabase URL secret not set (SUPABASE_URL)"; exit 1
-          fi
-
-          # Supabase anon key (accept either name)
-          if [ -n "${{ secrets.SUPABASE_KEY }}" ]; then
-            echo "SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}" >> $GITHUB_ENV
-          elif [ -n "${{ secrets.SUPABASE_ANON_KEY }}" ]; then
-            echo "SUPABASE_KEY=${{ secrets.SUPABASE_ANON_KEY }}" >> $GITHUB_ENV
-          else
-            echo "Supabase key secret not set (SUPABASE_KEY or SUPABASE_ANON_KEY)"; exit 1
-          fi
-
-          # Discord (optional but recommended)
-          if [ -n "${{ secrets.DISCORD_WEBHOOK_URL }}" ]; then
-            echo "DISCORD_WEBHOOK_URL=${{ secrets.DISCORD_WEBHOOK_URL }}" >> $GITHUB_ENV
-          fi
-          if [ -n "${{ secrets.DISCORD_WEBHOOK_LOG_URL }}" ]; then
-            echo "DISCORD_WEBHOOK_LOG_URL=${{ secrets.DISCORD_WEBHOOK_LOG_URL }}" >> $GITHUB_ENV
-          fi
-
-      - name: Verify env presence (temporary)
-        run: |
-          python - << 'PY'
-          import os
-          for k in ["SUPABASE_URL","SUPABASE_KEY","ACTIVE_USER","TZ_USER","DRY_RUN","DISCORD_WEBHOOK_URL","DISCORD_WEBHOOK_LOG_URL"]:
-              print(f"{k} => {'SET' if os.getenv(k) else 'MISSING'}")
-          PY
+          # Supabase
+          [ -n "${{ secrets.SUPABASE_URL }}" ] || { echo "Missing SUPABASE_URL"; exit 1; }
+          [ -n "${{ secrets.SUPABASE_KEY }}" ] || [ -n "${{ secrets.SUPABASE_ANON_KEY }}" ] || { echo "Missing SUPABASE_KEY or SUPABASE_ANON_KEY"; exit 1; }
+          echo "SUPABASE_URL=${{ secrets.SUPABASE_URL }}" >> $GITHUB_ENV
+          echo "SUPABASE_KEY=${{ secrets.SUPABASE_KEY || secrets.SUPABASE_ANON_KEY }}" >> $GITHUB_ENV
+          # Discord (optional)
+          [ -z "${{ secrets.DISCORD_WEBHOOK_URL }}" ] || echo "DISCORD_WEBHOOK_URL=${{ secrets.DISCORD_WEBHOOK_URL }}" >> $GITHUB_ENV
+          [ -z "${{ secrets.DISCORD_WEBHOOK_LOG_URL }}" ] || echo "DISCORD_WEBHOOK_LOG_URL=${{ secrets.DISCORD_WEBHOOK_LOG_URL }}" >> $GITHUB_ENV
 
       - name: Install deps
         run: |
@@ -75,6 +53,15 @@ jobs:
       - name: Run case
         env:
           CASE: ${{ inputs.case }}
+          ASOF: ${{ inputs.asof }}
         run: |
           echo "Run case \"$CASE\" in"
-          python -m tasks.morning_digest
+          if [ "$CASE" = "preclass" ]; then
+            if [ -n "$ASOF" ]; then
+              python -m tasks.pre_class_reminder --asof "$ASOF"
+            else
+              python -m tasks.pre_class_reminder
+            fi
+          else
+            python -m tasks.morning_digest
+          fi
