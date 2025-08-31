@@ -8,6 +8,8 @@ on:
         required: true
         type: choice
         options:
+          - schedule_parse
+          - schedule_apply
           - morning
           - pre
           - post
@@ -64,5 +66,7 @@ jobs:
             end_of_day) python -m tasks.end_of_day ;;
             tick)       python -m tasks.tick ;;
             heartbeat)  python -m tasks.heartbeat ;;
+            schedule_parse) python -m tasks.schedule_parse ;;
+            schedule_apply) python -m tasks.schedule_apply ;;
             *) echo "Unknown task"; exit 1 ;;
           esac
