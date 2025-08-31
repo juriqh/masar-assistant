@@ -59,10 +59,28 @@ jobs:
           if [ "$CASE" = "preclass" ]; then
             if [ -n "$ASOF" ]; then
               python -m tasks.pre_class --asof "$ASOF"
-            else
+            else:
               python -m tasks.pre_class
+            fi
+          elif [ "$CASE" = "postclass" ]; then
+            if [ -n "$ASOF" ]; then
+              python - << 'PY'
+              from datetime import datetime
+              from zoneinfo import ZoneInfo
+              from app import orchestrator
+              import os
+              asof = os.environ.get("ASOF","").strip()
+              asof_dt = datetime.strptime(asof, "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo("Asia/Riyadh"))
+              orchestrator.post_class_wrapup(asof=asof_dt)
+              PY
+            else:
+              python - << 'PY'
+              from app import orchestrator
+              orchestrator.post_class_wrapup()
+              PY
             fi
           else
             python -m tasks.morning_digest
           fi
+
 
